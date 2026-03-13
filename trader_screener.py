@@ -1,57 +1,58 @@
+"""
+Standalone tool: fetch Polymarket trades, compute per-trader PnL / ROI,
+and identify consistently profitable traders (potential bots).
+"""
+import logging
 import time
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Iterable, List
 
 import requests
 
-try:
-    import pandas as pd  # type: ignore
-except ModuleNotFoundError as e:
-    raise SystemExit(
-        "Missing dependency: pandas\n"
-        "Install with: pip install -r requirements.txt\n"
-    ) from e
+import pandas as pd
 
 try:
-    from tqdm import tqdm  # type: ignore
+    from tqdm import tqdm  # type: ignore[import-untyped]
 except ModuleNotFoundError:
-    def tqdm(it: Iterable[Any], desc: str = "") -> Iterable[Any]:  # type: ignore
+    def tqdm(it: Iterable[Any], desc: str = "") -> Iterable[Any]:  # type: ignore[misc]
         return it
 
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
 BASE_URL = "https://data-api.polymarket.com/trades"
-# data-api currently returns up to ~1000 rows per call even if you ask for more.
 LIMIT = 1000
 
 
-def fetch_trades(max_pages=20000):
-
-    all_trades = []
+def fetch_trades(max_pages: int = 100) -> pd.DataFrame:
+    all_trades: list[dict[str, Any]] = []
     offset = 0
 
     for _ in tqdm(range(max_pages), desc="Downloading trades"):
-
         url = f"{BASE_URL}?limit={LIMIT}&offset={offset}"
-
         try:
             r = requests.get(url, timeout=10)
             r.raise_for_status()
             data = r.json()
-        except Exception:
+        except requests.RequestException:
+            log.warning("Request failed at offset %d, stopping pagination.", offset)
             break
 
         if not data:
             break
 
         all_trades.extend(data)
-
-        # Use actual page size so we don't skip data if API caps `limit`.
         offset += len(data)
-
         time.sleep(0.2)
 
+    log.info("Downloaded %d trades across %d pages.", len(all_trades), offset // LIMIT)
     return pd.DataFrame(all_trades)
 
 
-def _pick_trader_column(df) -> str:
+def _pick_trader_column(df: pd.DataFrame) -> str:
     for c in ("trader", "proxyWallet", "wallet", "user"):
         if c in df.columns:
             return c
@@ -61,18 +62,13 @@ def _pick_trader_column(df) -> str:
     )
 
 
-def _pick_token_columns(df) -> List[str]:
-    """
-    Best-effort token identity for grouping positions.
-    We want something that uniquely identifies the outcome token.
-    """
-    # Common fields in data-api results / your CSV
+def _pick_token_columns(df: pd.DataFrame) -> List[str]:
     candidates = [
-        ["asset"],  # outcome token id (common)
-        ["conditionId", "outcomeIndex"],  # sometimes enough
-        ["conditionId", "outcome"],  # fallback
-        ["slug", "outcomeIndex"],  # fallback
-        ["title", "outcome"],  # weakest fallback
+        ["asset"],
+        ["conditionId", "outcomeIndex"],
+        ["conditionId", "outcome"],
+        ["slug", "outcomeIndex"],
+        ["title", "outcome"],
     ]
     for cols in candidates:
         if all(c in df.columns for c in cols):
@@ -83,12 +79,9 @@ def _pick_token_columns(df) -> List[str]:
     )
 
 
-def calculate_trader_stats(df: "pd.DataFrame") -> "pd.DataFrame":
+def calculate_trader_stats(df: pd.DataFrame) -> pd.DataFrame:
+    log.info("Preparing data...")
 
-    print("\nPreparing data...")
-
-    # data-api timestamps are unix seconds in practice
-    # (if already ISO strings, pandas will still parse them)
     if "timestamp" in df.columns:
         if pd.api.types.is_numeric_dtype(df["timestamp"]):
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
@@ -101,7 +94,6 @@ def calculate_trader_stats(df: "pd.DataFrame") -> "pd.DataFrame":
     trader_col = _pick_trader_column(df)
     token_cols = _pick_token_columns(df)
 
-    # Clean + ensure numeric
     needed = ["side", "price", "size", trader_col, *token_cols]
     missing = [c for c in needed if c not in df.columns]
     if missing:
@@ -112,10 +104,8 @@ def calculate_trader_stats(df: "pd.DataFrame") -> "pd.DataFrame":
     df["size"] = pd.to_numeric(df["size"], errors="coerce")
     df = df.dropna(subset=["price", "size", "side", trader_col])
 
-    # USD notional on each fill
     df["notional_usd"] = df["price"] * df["size"]
 
-    # Latest price per token (mark-to-market for open positions)
     if "timestamp" in df.columns:
         last_prices = (
             df.dropna(subset=["timestamp"])
@@ -131,7 +121,6 @@ def calculate_trader_stats(df: "pd.DataFrame") -> "pd.DataFrame":
               .rename(columns={"price": "last_price"})
         )
 
-    # Aggregate per trader + token to compute positions
     buys = df[df["side"] == "BUY"]
     sells = df[df["side"] != "BUY"]
 
@@ -149,14 +138,11 @@ def calculate_trader_stats(df: "pd.DataFrame") -> "pd.DataFrame":
     pos["last_price"] = pos["last_price"].fillna(pos["buy_usd"] / pos["buy_shares"].replace(0, pd.NA))
     pos["last_price"] = pos["last_price"].fillna(0)
 
-    # Cashflow PnL + mark-to-market value of net position
-    # net_cashflow = money received from sells - money paid for buys
     pos["net_cashflow_usd"] = pos["sell_usd"] - pos["buy_usd"]
     pos["net_shares"] = pos["buy_shares"] - pos["sell_shares"]
     pos["m2m_open_usd"] = pos["net_shares"] * pos["last_price"]
     pos["pnl_est_usd"] = pos["net_cashflow_usd"] + pos["m2m_open_usd"]
 
-    # Roll up to trader level
     stats = (
         pos.groupby(trader_col, as_index=False)
            .agg(
@@ -171,7 +157,7 @@ def calculate_trader_stats(df: "pd.DataFrame") -> "pd.DataFrame":
                pnl_est_usd=("pnl_est_usd", "sum"),
            )
     )
-    # add sell trades into trades count (approx)
+
     sell_trades = (
         sell_by.groupby(trader_col, as_index=False)
                .agg(sell_trades=("sell_trades", "sum"))
@@ -188,43 +174,31 @@ def calculate_trader_stats(df: "pd.DataFrame") -> "pd.DataFrame":
     return stats
 
 
-def detect_profitable_bots(stats):
-
+def detect_profitable_bots(stats: pd.DataFrame) -> pd.DataFrame:
     bots = stats[
         (stats["trades"] > 200) &
         (stats["volume_usd"] > 1000)
     ]
-
-    bots = bots.sort_values("pnl_est_usd", ascending=False)
-
-    return bots
+    return bots.sort_values("pnl_est_usd", ascending=False)
 
 
-def main():
-
-    print("\nDownloading trades from Polymarket...\n")
+def main() -> None:
+    log.info("Downloading trades from Polymarket...")
 
     df = fetch_trades()
-
-    print("\nTrades downloaded:", len(df))
+    log.info("Trades downloaded: %d", len(df))
 
     df.to_csv("polymarket_trades.csv", index=False)
-
-    print("\nSaved polymarket_trades.csv")
+    log.info("Saved polymarket_trades.csv")
 
     stats = calculate_trader_stats(df)
-
     stats.to_csv("trader_stats_full.csv", index=False)
-
-    print("\nSaved trader_stats_full.csv")
+    log.info("Saved trader_stats_full.csv")
 
     bots = detect_profitable_bots(stats)
-
     bots.to_csv("top_profitable_bots.csv", index=False)
 
-    print("\nTop profitable bots:\n")
-
-    print(bots.head(20))
+    log.info("Top profitable bots:\n%s", bots.head(20).to_string())
 
 
 if __name__ == "__main__":
