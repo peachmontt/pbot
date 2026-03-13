@@ -1,0 +1,6 @@
+requests>=2.31.0
+pandas>=2.0.0
+tqdm
+python-dotenv>=1.0.0
+py-clob-client
+eth-account
