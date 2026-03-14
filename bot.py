@@ -1,12 +1,11 @@
 """
 Polymarket range-trading bot — main loop.
 
-For each BTC/ETH/SOL market:
-  1. Fetch volatility from Binance
-  2. Compute buy/sell levels (wider spread = higher vol)
-  3. Place paired limit orders: BUY YES below mid, BUY NO below mid
-  4. Monitor fills → place take-profit SELL orders
-  5. Monitor stop-losses → market exit if 20% adverse move
+For every active binary market:
+  1. Compute buy/sell levels using a fixed volatility spread
+  2. Place paired limit orders: BUY YES below mid, BUY NO below mid
+  3. Monitor fills → place take-profit SELL orders
+  4. Monitor stop-losses → market exit if 20% adverse move
 """
 from __future__ import annotations
 
@@ -22,28 +21,35 @@ logging.basicConfig(
 )
 
 from config import (
-    DEFAULT_ORDER_SIZE,
     MAX_OPEN_POSITIONS,
     MAX_POSITION_USD,
+    ORDER_BUDGET_USD,
     PAPER_TRADING,
     SCAN_INTERVAL,
+    STRATEGY,
 )
 from journal import log_event
 from models import LegType, LimitOrder, OrderSide, OrderStatus
 from positions import PositionManager
 from scanner import get_markets
-from strategy import OrderLevels, compute_levels
+from strategies import OrderLevels, load_strategy
 from trader import (
     cancel_order,
     get_mid_price,
     market_sell,
     place_limit_order,
 )
-from volatility import get_all_volatilities
 
 log = logging.getLogger(__name__)
 
 MAX_BACKOFF_SECONDS = 300
+
+
+def _shares_for_budget(price: float) -> float:
+    """Convert a dollar budget into number of shares at the given price."""
+    if price <= 0:
+        return 0.0
+    return round(ORDER_BUDGET_USD / price, 2)
 
 
 def _place_entry_orders(
@@ -52,19 +58,20 @@ def _place_entry_orders(
 ) -> bool:
     """Place the paired BUY YES + BUY NO entry orders for a market."""
     cond_id = levels.condition_id
-    size = DEFAULT_ORDER_SIZE
 
     if manager.has_position(cond_id):
         return False
 
-    cost = (levels.buy_yes_price + levels.buy_no_price) * size
+    yes_size = _shares_for_budget(levels.buy_yes_price)
+    no_size = _shares_for_budget(levels.buy_no_price)
+    cost = ORDER_BUDGET_USD * 2
     if not manager.can_open(cost):
         return False
 
     pos = manager.create_position(cond_id, levels.question, levels.asset)
 
     yes_result = place_limit_order(
-        levels.yes_token_id, levels.buy_yes_price, size, "BUY",
+        levels.yes_token_id, levels.buy_yes_price, yes_size, "BUY",
     )
     if yes_result.get("success"):
         order = LimitOrder(
@@ -73,7 +80,7 @@ def _place_entry_orders(
             side=OrderSide.BUY,
             leg=LegType.YES,
             price=levels.buy_yes_price,
-            size=size,
+            size=yes_size,
             condition_id=cond_id,
             question=levels.question,
             take_profit_price=levels.sell_yes_price,
@@ -84,12 +91,12 @@ def _place_entry_orders(
         log_event(
             market=levels.question, asset=levels.asset,
             condition_id=cond_id, leg="YES", action="BUY_LIMIT_PLACED",
-            entry_price=levels.buy_yes_price, size=size,
+            entry_price=levels.buy_yes_price, size=yes_size,
             notes=f"tp={levels.sell_yes_price:.2f} sl={levels.stop_loss_yes:.2f}",
         )
 
     no_result = place_limit_order(
-        levels.no_token_id, levels.buy_no_price, size, "BUY",
+        levels.no_token_id, levels.buy_no_price, no_size, "BUY",
     )
     if no_result.get("success"):
         order = LimitOrder(
@@ -98,7 +105,7 @@ def _place_entry_orders(
             side=OrderSide.BUY,
             leg=LegType.NO,
             price=levels.buy_no_price,
-            size=size,
+            size=no_size,
             condition_id=cond_id,
             question=levels.question,
             take_profit_price=levels.sell_no_price,
@@ -109,7 +116,7 @@ def _place_entry_orders(
         log_event(
             market=levels.question, asset=levels.asset,
             condition_id=cond_id, leg="NO", action="BUY_LIMIT_PLACED",
-            entry_price=levels.buy_no_price, size=size,
+            entry_price=levels.buy_no_price, size=no_size,
             notes=f"tp={levels.sell_no_price:.2f} sl={levels.stop_loss_no:.2f}",
         )
 
@@ -228,45 +235,31 @@ def _get_current_prices(manager: PositionManager) -> dict[str, float]:
 
 def run_bot() -> None:
     mode = "PAPER" if PAPER_TRADING else "LIVE"
-    log.info("Range-trading bot started (%s mode). Press Ctrl+C to stop.", mode)
+    compute_levels = load_strategy(STRATEGY)
+    log.info(
+        "Bot started (%s mode, strategy=%s). Press Ctrl+C to stop.", mode, STRATEGY,
+    )
 
     manager = PositionManager(MAX_OPEN_POSITIONS, MAX_POSITION_USD)
     backoff = SCAN_INTERVAL
     consecutive_errors = 0
 
-    volatilities: dict[str, float] = {}
-    vol_fetched_at = 0.0
-    VOL_REFRESH_INTERVAL = 3600
-
     while True:
         try:
-            # --- Step 1: Fetch volatility from Binance (cached for 1 hour) ---
-            now = time.time()
-            if not volatilities or (now - vol_fetched_at) >= VOL_REFRESH_INTERVAL:
-                volatilities = get_all_volatilities()
-                vol_fetched_at = now
-            if not volatilities:
-                log.warning("No volatility data, skipping cycle.")
-                time.sleep(backoff)
-                continue
-
-            # --- Step 2: Scan and place orders for new markets only ---
-            if manager.open_count < MAX_OPEN_POSITIONS:
+            # --- Step 1: Scan all markets and place orders ---
+            if not MAX_OPEN_POSITIONS or manager.open_count < MAX_OPEN_POSITIONS:
                 markets = get_markets()
                 if not markets.empty:
                     new_count = 0
                     for _, market in markets.iterrows():
-                        vol = volatilities.get(market["asset"])
-                        if vol is None:
-                            continue
-                        levels = compute_levels(market.to_dict(), vol)
+                        levels = compute_levels(market.to_dict())
                         if levels and not manager.has_position(levels.condition_id):
                             if _place_entry_orders(levels, manager):
                                 new_count += 1
                     if new_count:
                         log.info("Placed orders on %d new market(s).", new_count)
 
-            # --- Step 3: Monitor existing positions ---
+            # --- Step 2: Monitor existing positions ---
             if manager.open_count > 0:
                 current_prices = _get_current_prices(manager)
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from config import PAPER_TRADING, STOP_LOSS_PCT
+from config import PAPER_TRADING
 from models import LegType, LimitOrder, OrderSide, OrderStatus
 
 log = logging.getLogger(__name__)
@@ -109,10 +109,10 @@ class PositionManager:
         return condition_id in self._positions
 
     def can_open(self, cost_usd: float) -> bool:
-        if self.open_count >= self.max_positions:
+        if self.max_positions and self.open_count >= self.max_positions:
             log.warning("Position limit reached (%d/%d)", self.open_count, self.max_positions)
             return False
-        if self.total_exposure_usd + cost_usd > self.max_exposure_usd:
+        if self.max_exposure_usd and self.total_exposure_usd + cost_usd > self.max_exposure_usd:
             log.warning(
                 "Exposure limit: $%.2f + $%.2f > $%.2f",
                 self.total_exposure_usd, cost_usd, self.max_exposure_usd,

@@ -5,5 +5,15 @@ python-dotenv>=1.0.0
 py-clob-client
 eth-account
 
+# analyzer module
+httpx>=0.27
+polars>=1.0
+pydantic>=2.0
+pydantic-settings>=2.0
+typer>=0.12
+rich>=13.0
+plotly>=5.0
+tenacity>=9.0
+
 # dev / testing
 pytest>=8.0.0

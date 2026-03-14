@@ -1,7 +1,7 @@
 import json
 from unittest.mock import MagicMock, patch
 
-from scanner import _parse_array_maybe_json, detect_asset, get_markets
+from scanner import _parse_array_maybe_json, get_markets
 
 
 class TestParseArrayMaybeJson:
@@ -24,34 +24,12 @@ class TestParseArrayMaybeJson:
         assert _parse_array_maybe_json(42) is None
 
 
-class TestDetectAsset:
-    def test_detects_btc(self):
-        assert detect_asset("Will BTC hit 100k?") == "BTC"
-
-    def test_detects_bitcoin_full_name(self):
-        assert detect_asset("Will Bitcoin reach 100k?") == "BTC"
-
-    def test_detects_eth(self):
-        assert detect_asset("ETH above 5000?") == "ETH"
-
-    def test_detects_sol(self):
-        assert detect_asset("SOL to $200?") == "SOL"
-
-    def test_case_insensitive(self):
-        assert detect_asset("btc price") == "BTC"
-
-    def test_no_match_returns_none(self):
-        assert detect_asset("Will DOGE moon?") is None
-
-
 def _make_gamma_market(
     question="Will BTC hit 100k?",
     outcomes=None,
     prices=None,
     token_ids=None,
     condition_id="cond123",
-    volume=5000.0,
-    end_date="2027-06-01T00:00:00Z",
 ):
     return {
         "question": question,
@@ -60,8 +38,6 @@ def _make_gamma_market(
         "clobTokenIds": json.dumps(token_ids or ["tok_yes", "tok_no"]),
         "conditionId": condition_id,
         "slug": "btc-100k",
-        "volume24hr": volume,
-        "endDate": end_date,
     }
 
 
@@ -79,7 +55,7 @@ class TestGetMarkets:
         assert df.iloc[0]["no_price"] == 0.35
 
     @patch("scanner.requests.get")
-    def test_filters_non_crypto(self, mock_get):
+    def test_accepts_any_topic(self, mock_get):
         mock_resp = MagicMock()
         mock_resp.json.return_value = [
             _make_gamma_market(question="Will DOGE hit $1?"),
@@ -88,13 +64,13 @@ class TestGetMarkets:
         mock_get.return_value = mock_resp
 
         df = get_markets()
-        assert df.empty
+        assert len(df) == 1
 
     @patch("scanner.requests.get")
-    def test_filters_low_volume(self, mock_get):
+    def test_skips_bad_data(self, mock_get):
         mock_resp = MagicMock()
         mock_resp.json.return_value = [
-            _make_gamma_market(volume=10.0),
+            _make_gamma_market(outcomes=["Yes"]),
         ]
         mock_resp.raise_for_status = MagicMock()
         mock_get.return_value = mock_resp
@@ -103,10 +79,10 @@ class TestGetMarkets:
         assert df.empty
 
     @patch("scanner.requests.get")
-    def test_filters_near_expiry(self, mock_get):
+    def test_skips_missing_token_ids(self, mock_get):
         mock_resp = MagicMock()
         mock_resp.json.return_value = [
-            _make_gamma_market(end_date="2026-03-14T00:00:00Z"),
+            _make_gamma_market(token_ids=["tok_yes"]),
         ]
         mock_resp.raise_for_status = MagicMock()
         mock_get.return_value = mock_resp
@@ -115,15 +91,15 @@ class TestGetMarkets:
         assert df.empty
 
     @patch("scanner.requests.get")
-    def test_includes_volume_and_expiry_columns(self, mock_get):
+    def test_deduplicates_by_condition_id(self, mock_get):
+        m = _make_gamma_market()
         mock_resp = MagicMock()
-        mock_resp.json.return_value = [_make_gamma_market()]
+        mock_resp.json.return_value = [m, m]
         mock_resp.raise_for_status = MagicMock()
         mock_get.return_value = mock_resp
 
         df = get_markets()
-        assert "volume_24h" in df.columns
-        assert "days_to_expiry" in df.columns
+        assert len(df) == 1
 
     @patch("scanner.requests.get")
     def test_returns_empty_df_on_no_data(self, mock_get):
@@ -131,6 +107,43 @@ class TestGetMarkets:
         mock_resp.json.return_value = []
         mock_resp.raise_for_status = MagicMock()
         mock_get.return_value = mock_resp
+
+        df = get_markets()
+        assert df.empty
+
+    @patch("scanner.requests.get")
+    def test_paginates_multiple_pages(self, mock_get):
+        page1 = [_make_gamma_market(condition_id=f"c{i}") for i in range(500)]
+        page2 = [_make_gamma_market(condition_id=f"c{i}") for i in range(500, 510)]
+
+        responses = []
+        for data in [page1, page2]:
+            resp = MagicMock()
+            resp.json.return_value = data
+            resp.raise_for_status = MagicMock()
+            responses.append(resp)
+
+        mock_get.side_effect = responses
+        df = get_markets()
+        assert len(df) == 510
+
+    @patch("scanner.requests.get")
+    def test_stops_pagination_on_short_page(self, mock_get):
+        page1 = [_make_gamma_market(condition_id=f"c{i}") for i in range(100)]
+
+        resp = MagicMock()
+        resp.json.return_value = page1
+        resp.raise_for_status = MagicMock()
+        mock_get.return_value = resp
+
+        df = get_markets()
+        assert len(df) == 100
+        assert mock_get.call_count == 1
+
+    @patch("scanner.requests.get")
+    def test_handles_api_error(self, mock_get):
+        import requests as req
+        mock_get.side_effect = req.RequestException("timeout")
 
         df = get_markets()
         assert df.empty

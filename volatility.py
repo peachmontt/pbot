@@ -12,7 +12,9 @@ from typing import Optional
 
 import requests
 
-from config import BINANCE_API, BINANCE_SYMBOLS, VOLATILITY_WINDOW_HOURS
+BINANCE_API = "https://api.binance.com/api/v3"
+BINANCE_SYMBOLS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT"}
+VOLATILITY_WINDOW_HOURS = 24
 
 log = logging.getLogger(__name__)
 
