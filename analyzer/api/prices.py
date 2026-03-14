@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Callable
 
 from analyzer.api.client import PolymarketClient
 
@@ -53,3 +55,38 @@ async def fetch_price_history(
         window_start = window_end
 
     return all_points
+
+
+async def fetch_prices_batch(
+    client: PolymarketClient,
+    assets: list[str],
+    start_ts: int,
+    end_ts: int,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> dict[str, list[dict]]:
+    """Fetch price history for many assets concurrently.
+
+    Uses the client's built-in semaphore and throttle for rate-limiting.
+    Returns {asset_id: [price_points]} for assets that had data.
+    """
+    results: dict[str, list[dict]] = {}
+    completed = 0
+    total = len(assets)
+    lock = asyncio.Lock()
+
+    async def _fetch_one(asset_id: str) -> None:
+        nonlocal completed
+        points = await fetch_price_history(client, asset_id, start_ts, end_ts)
+        async with lock:
+            if points:
+                results[asset_id] = points
+            completed += 1
+            if on_progress is not None:
+                on_progress(completed, total)
+
+    batch_size = 50
+    for i in range(0, total, batch_size):
+        batch = assets[i : i + batch_size]
+        await asyncio.gather(*[_fetch_one(a) for a in batch])
+
+    return results

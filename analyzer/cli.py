@@ -14,7 +14,7 @@ from rich.table import Table
 from analyzer.api.client import PolymarketClient
 from analyzer.api.activity import fetch_activity
 from analyzer.api.markets import fetch_markets_batch
-from analyzer.api.prices import fetch_price_history
+from analyzer.api.prices import fetch_prices_batch
 from analyzer.api.trades import fetch_all_trades
 from analyzer.config import settings
 from analyzer.db import Repository, init_db
@@ -92,21 +92,31 @@ async def _fetch(wallet: str, days: int, db_path: Path) -> None:
         )
         progress.stop_task(task3)
 
-        # 4. Fetch price history for all unique assets
+        # 4. Fetch price history for assets not yet cached
         task4 = progress.add_task("Fetching price history...", total=None)
         with Repository(db_path) as repo:
-            assets = repo.get_unique_assets(wallet)
+            all_assets = repo.get_unique_assets(wallet)
+            assets_to_fetch = repo.get_assets_missing_prices(wallet)
 
-        count = 0
+        cached = len(all_assets) - len(assets_to_fetch)
+        if cached:
+            progress.update(task4, description=f"Fetching price history ({cached} cached, {len(assets_to_fetch)} remaining)...")
+
+        def _on_price_progress(done: int, total: int) -> None:
+            progress.update(task4, description=f"Fetching price history... {done + cached}/{len(all_assets)} assets")
+
         async with PolymarketClient.clob_api() as clob_client:
-            for asset in assets:
-                prices = await fetch_price_history(clob_client, asset, start_ts, end_ts)
-                if prices:
-                    price_dicts = [{"timestamp": p["t"], "price": p["p"]} for p in prices]
-                    with Repository(db_path) as repo:
-                        repo.insert_price_history(asset, price_dicts)
-                    count += 1
-        progress.update(task4, description=f"Fetched price history for {count}/{len(assets)} assets")
+            results = await fetch_prices_batch(
+                clob_client, assets_to_fetch, start_ts, end_ts,
+                on_progress=_on_price_progress,
+            )
+
+        with Repository(db_path) as repo:
+            for asset_id, points in results.items():
+                price_dicts = [{"timestamp": p["t"], "price": p["p"]} for p in points]
+                repo.insert_price_history(asset_id, price_dicts)
+
+        progress.update(task4, description=f"Fetched price history for {len(results) + cached}/{len(all_assets)} assets")
         progress.stop_task(task4)
 
     console.print(

@@ -182,6 +182,17 @@ class Repository:
         ).fetchall()
         return [row["asset"] for row in rows]
 
+    def get_assets_missing_prices(self, wallet: str) -> list[str]:
+        """Return assets for a wallet that have no rows in price_history yet."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT t.asset FROM raw_trades t "
+            "LEFT JOIN price_history p ON t.asset = p.asset "
+            "WHERE t.wallet = ? AND p.asset IS NULL "
+            "ORDER BY t.asset",
+            (wallet,),
+        ).fetchall()
+        return [row["asset"] for row in rows]
+
     def get_trade_count(self, wallet: str) -> int:
         row = self._conn.execute(
             "SELECT COUNT(*) AS cnt FROM raw_trades WHERE wallet = ?", (wallet,)

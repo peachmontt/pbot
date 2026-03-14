@@ -1,7 +1,7 @@
 from analyzer.api.activity import fetch_activity
 from analyzer.api.client import PolymarketClient
 from analyzer.api.markets import fetch_event, fetch_market, fetch_markets_batch
-from analyzer.api.prices import fetch_price_history
+from analyzer.api.prices import fetch_price_history, fetch_prices_batch
 from analyzer.api.trades import fetch_all_trades
 
 __all__ = [
@@ -12,4 +12,5 @@ __all__ = [
     "fetch_market",
     "fetch_markets_batch",
     "fetch_price_history",
+    "fetch_prices_batch",
 ]
