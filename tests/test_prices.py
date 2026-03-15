@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from analyzer.api.prices import fetch_prices_batch
+from analyzer.api.prices import _merge_asset_windows, fetch_prices_batch, fetch_prices_for_rounds
 from analyzer.db.repository import Repository
 from analyzer.db.schema import ALL_TABLES, INDEXES
 
@@ -151,6 +151,75 @@ class TestFetchPricesBatch:
         result = asyncio.run(
             fetch_prices_batch(
                 client, ["a1"], start_ts=0, end_ts=86400,
+                on_progress=lambda done, total: calls.append((done, total)),
+            )
+        )
+
+        assert len(calls) >= 1
+        assert calls[-1] == (1, 1)
+
+
+# ── _merge_asset_windows ──────────────────────────────────────────────
+
+
+class TestMergeAssetWindows:
+    def test_single_window(self) -> None:
+        result = _merge_asset_windows([("a1", 100, 200)])
+        assert result == {"a1": (100, 200)}
+
+    def test_merges_same_asset(self) -> None:
+        windows = [("a1", 100, 200), ("a1", 150, 300), ("a1", 50, 120)]
+        result = _merge_asset_windows(windows)
+        assert result == {"a1": (50, 300)}
+
+    def test_keeps_different_assets_separate(self) -> None:
+        windows = [("a1", 100, 200), ("a2", 300, 400)]
+        result = _merge_asset_windows(windows)
+        assert result == {"a1": (100, 200), "a2": (300, 400)}
+
+    def test_empty_input(self) -> None:
+        assert _merge_asset_windows([]) == {}
+
+
+# ── fetch_prices_for_rounds ───────────────────────────────────────────
+
+
+class TestFetchPricesForRounds:
+    def test_fetches_only_needed_windows(self) -> None:
+        responses = {
+            "a1": [{"t": 100, "p": 0.5}],
+            "a2": [{"t": 300, "p": 0.7}],
+        }
+        client = _make_mock_client(responses)
+        round_windows = [("a1", 50, 200), ("a2", 250, 400)]
+
+        result = asyncio.run(fetch_prices_for_rounds(client, round_windows))
+
+        assert "a1" in result
+        assert "a2" in result
+
+    def test_merges_windows_for_same_asset(self) -> None:
+        responses = {"a1": [{"t": 100, "p": 0.5}]}
+        client = _make_mock_client(responses)
+        round_windows = [("a1", 50, 200), ("a1", 150, 300)]
+
+        result = asyncio.run(fetch_prices_for_rounds(client, round_windows))
+
+        assert "a1" in result
+
+    def test_empty_rounds(self) -> None:
+        client = _make_mock_client({})
+        result = asyncio.run(fetch_prices_for_rounds(client, []))
+        assert result == {}
+
+    def test_progress_callback(self) -> None:
+        responses = {"a1": [{"t": 100, "p": 0.5}]}
+        client = _make_mock_client(responses)
+        calls: list[tuple[int, int]] = []
+
+        asyncio.run(
+            fetch_prices_for_rounds(
+                client, [("a1", 50, 200)],
                 on_progress=lambda done, total: calls.append((done, total)),
             )
         )

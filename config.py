@@ -34,7 +34,8 @@ MIN_ORDERBOOK_LIQUIDITY_USD = 5.0
 FEE_RATE = 0.02
 
 # Strategy selection: name of a module inside the strategies/ package
-STRATEGY = "model_1"
+# model_1 = symmetric range trading, model_2 = momentum following
+STRATEGY = os.getenv("STRATEGY", "model_2")
 
 # Risk limits (0 = unlimited)
 MAX_OPEN_POSITIONS = 0

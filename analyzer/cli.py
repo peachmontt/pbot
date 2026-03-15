@@ -14,7 +14,7 @@ from rich.table import Table
 from analyzer.api.client import PolymarketClient
 from analyzer.api.activity import fetch_activity
 from analyzer.api.markets import fetch_markets_batch
-from analyzer.api.prices import fetch_prices_batch
+from analyzer.api.prices import fetch_prices_for_rounds
 from analyzer.api.trades import fetch_all_trades
 from analyzer.config import settings
 from analyzer.db import Repository, init_db
@@ -92,40 +92,49 @@ async def _fetch(wallet: str, days: int, db_path: Path) -> None:
         )
         progress.stop_task(task3)
 
-        # 4. Fetch price history for assets not yet cached
-        task4 = progress.add_task("Fetching price history...", total=None)
-        with Repository(db_path) as repo:
-            all_assets = repo.get_unique_assets(wallet)
-            assets_to_fetch = repo.get_assets_missing_prices(wallet)
-
-        cached = len(all_assets) - len(assets_to_fetch)
-        if cached:
-            progress.update(task4, description=f"Fetching price history ({cached} cached, {len(assets_to_fetch)} remaining)...")
-
-        def _on_price_progress(done: int, total: int) -> None:
-            progress.update(task4, description=f"Fetching price history... {done + cached}/{len(all_assets)} assets")
-
-        async with PolymarketClient.clob_api() as clob_client:
-            results = await fetch_prices_batch(
-                clob_client, assets_to_fetch, start_ts, end_ts,
-                on_progress=_on_price_progress,
-            )
-
-        with Repository(db_path) as repo:
-            for asset_id, points in results.items():
-                price_dicts = [{"timestamp": p["t"], "price": p["p"]} for p in points]
-                repo.insert_price_history(asset_id, price_dicts)
-
-        progress.update(task4, description=f"Fetched price history for {len(results) + cached}/{len(all_assets)} assets")
-        progress.stop_task(task4)
-
     console.print(
         Panel(
             f"[green]Fetch complete for {wallet}[/]\n"
-            f"Trades: {len(raw_trades)} | Markets: {len(raw_markets)} | Price series: {count}",
+            f"Trades: {len(raw_trades)} | Markets: {len(raw_markets)}",
             title="Done",
         )
     )
+
+
+async def _fetch_round_prices(wallet: str, db_path: Path) -> int:
+    """Fetch price history only for the time windows of closed rounds."""
+    with Repository(db_path) as repo:
+        rounds = repo.get_rounds(wallet)
+
+    round_windows = [
+        (r["asset"], r["entry_time"], r["exit_time"])
+        for r in rounds
+        if r.get("is_closed") and r.get("entry_time") and r.get("exit_time")
+    ]
+    if not round_windows:
+        return 0
+
+    with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+        task = progress.add_task(f"Fetching prices for {len(round_windows)} closed rounds...", total=None)
+
+        def _on_progress(done: int, total: int) -> None:
+            progress.update(task, description=f"Fetching round prices... {done}/{total} assets")
+
+        async with PolymarketClient.clob_api() as clob_client:
+            results = await fetch_prices_for_rounds(
+                clob_client, round_windows, on_progress=_on_progress,
+            )
+
+        stored = 0
+        with Repository(db_path) as repo:
+            for asset_id, points in results.items():
+                price_dicts = [{"timestamp": p["t"], "price": p["p"]} for p in points]
+                stored += repo.insert_price_history(asset_id, price_dicts)
+
+        progress.update(task, description=f"Fetched prices for {len(results)} assets ({stored} data points)")
+        progress.stop_task(task)
+
+    return len(results)
 
 
 @app.command()
@@ -135,7 +144,7 @@ def fetch(
     db: str | None = typer.Option(None, "--db", help="Custom database path"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Fetch all trades, market metadata, and price history for a wallet."""
+    """Fetch all trades and market metadata for a wallet."""
     _setup_logging(verbose)
     asyncio.run(_fetch(wallet, days, _resolve_db_path(db)))
 
@@ -335,22 +344,28 @@ def analyze(
     db: str | None = typer.Option(None, "--db"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Run the full pipeline: fetch -> build-rounds -> metrics -> classify."""
+    """Run the full pipeline: fetch -> rounds -> prices -> enrich -> metrics -> classify."""
     _setup_logging(verbose)
     db_path = _resolve_db_path(db)
 
     console.print(Panel(f"[bold]Full analysis for {wallet}[/]\nLookback: {days} days", title="Analyze"))
 
-    console.rule("Step 1/4: Fetch data")
+    console.rule("Step 1/6: Fetch data")
     asyncio.run(_fetch(wallet, days, db_path))
 
-    console.rule("Step 2/4: Build rounds")
+    console.rule("Step 2/6: Build rounds")
     build_rounds(wallet, str(db_path), verbose)
 
-    console.rule("Step 3/4: Compute metrics")
+    console.rule("Step 3/6: Fetch round prices")
+    asyncio.run(_fetch_round_prices(wallet, db_path))
+
+    console.rule("Step 4/6: Enrich rounds with MFE/MAE")
+    build_rounds(wallet, str(db_path), verbose)
+
+    console.rule("Step 5/6: Compute metrics")
     metrics(wallet, str(db_path), verbose)
 
-    console.rule("Step 4/4: Classify strategy")
+    console.rule("Step 6/6: Classify strategy")
     classify(wallet, str(db_path), verbose)
 
 

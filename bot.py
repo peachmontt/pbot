@@ -1,11 +1,16 @@
 """
-Polymarket range-trading bot — main loop.
+Polymarket trading bot — main loop.
 
-For every active binary market:
-  1. Compute buy/sell levels using a fixed volatility spread
-  2. Place paired limit orders: BUY YES below mid, BUY NO below mid
-  3. Monitor fills → place take-profit SELL orders
-  4. Monitor stop-losses → market exit if 20% adverse move
+Supports two modes via STRATEGY config:
+  - model_1: Symmetric range trading (BUY YES + BUY NO around mid-price)
+  - model_2: Momentum following (directional BUY on one side only)
+
+Cycle:
+  1. Scan active markets, track prices for momentum detection
+  2. Compute entry levels using the active strategy
+  3. Place limit orders (paired or directional depending on strategy)
+  4. Monitor fills → place take-profit SELL orders
+  5. Monitor stop-losses → market exit on adverse move
 """
 from __future__ import annotations
 
@@ -31,6 +36,7 @@ from config import (
 from journal import log_event
 from models import LegType, LimitOrder, OrderSide, OrderStatus
 from positions import PositionManager
+from price_tracker import PriceTracker
 from scanner import get_markets
 from strategies import OrderLevels, load_strategy
 from trader import (
@@ -56,79 +62,104 @@ def _place_entry_orders(
     levels: OrderLevels,
     manager: PositionManager,
 ) -> bool:
-    """Place the paired BUY YES + BUY NO entry orders for a market."""
+    """Place entry orders for a market.
+
+    Handles both symmetric (model_1: both YES+NO) and directional
+    (model_2: only the side with price > 0) entries.
+    """
     cond_id = levels.condition_id
 
     if manager.has_position(cond_id):
         return False
 
-    yes_size = _shares_for_budget(levels.buy_yes_price)
-    no_size = _shares_for_budget(levels.buy_no_price)
-    cost = ORDER_BUDGET_USD * 2
+    has_yes = levels.buy_yes_price > 0
+    has_no = levels.buy_no_price > 0
+    sides = (1 if has_yes else 0) + (1 if has_no else 0)
+    cost = ORDER_BUDGET_USD * sides
     if not manager.can_open(cost):
         return False
 
     pos = manager.create_position(cond_id, levels.question, levels.asset)
+    placed = False
 
-    yes_result = place_limit_order(
-        levels.yes_token_id, levels.buy_yes_price, yes_size, "BUY",
-    )
-    if yes_result.get("success"):
-        order = LimitOrder(
-            order_id=yes_result["order_id"],
-            token_id=levels.yes_token_id,
-            side=OrderSide.BUY,
-            leg=LegType.YES,
-            price=levels.buy_yes_price,
-            size=yes_size,
-            condition_id=cond_id,
-            question=levels.question,
-            take_profit_price=levels.sell_yes_price,
-            stop_loss_price=levels.stop_loss_yes,
+    if has_yes:
+        yes_size = _shares_for_budget(levels.buy_yes_price)
+        yes_result = place_limit_order(
+            levels.yes_token_id, levels.buy_yes_price, yes_size, "BUY",
         )
-        order.status = OrderStatus.ACTIVE
-        pos.entry_yes = order
-        log_event(
-            market=levels.question, asset=levels.asset,
-            condition_id=cond_id, leg="YES", action="BUY_LIMIT_PLACED",
-            entry_price=levels.buy_yes_price, size=yes_size,
-            notes=f"tp={levels.sell_yes_price:.2f} sl={levels.stop_loss_yes:.2f}",
-        )
+        if yes_result.get("success"):
+            order = LimitOrder(
+                order_id=yes_result["order_id"],
+                token_id=levels.yes_token_id,
+                side=OrderSide.BUY,
+                leg=LegType.YES,
+                price=levels.buy_yes_price,
+                size=yes_size,
+                condition_id=cond_id,
+                question=levels.question,
+                take_profit_price=levels.sell_yes_price,
+                stop_loss_price=levels.stop_loss_yes,
+            )
+            order.status = OrderStatus.ACTIVE
+            pos.entry_yes = order
+            placed = True
+            log_event(
+                market=levels.question, asset=levels.asset,
+                condition_id=cond_id, leg="YES", action="BUY_LIMIT_PLACED",
+                entry_price=levels.buy_yes_price, size=yes_size,
+                notes=f"tp={levels.sell_yes_price:.2f} sl={levels.stop_loss_yes:.2f}",
+            )
 
-    no_result = place_limit_order(
-        levels.no_token_id, levels.buy_no_price, no_size, "BUY",
-    )
-    if no_result.get("success"):
-        order = LimitOrder(
-            order_id=no_result["order_id"],
-            token_id=levels.no_token_id,
-            side=OrderSide.BUY,
-            leg=LegType.NO,
-            price=levels.buy_no_price,
-            size=no_size,
-            condition_id=cond_id,
-            question=levels.question,
-            take_profit_price=levels.sell_no_price,
-            stop_loss_price=levels.stop_loss_no,
+    if has_no:
+        no_size = _shares_for_budget(levels.buy_no_price)
+        no_result = place_limit_order(
+            levels.no_token_id, levels.buy_no_price, no_size, "BUY",
         )
-        order.status = OrderStatus.ACTIVE
-        pos.entry_no = order
-        log_event(
-            market=levels.question, asset=levels.asset,
-            condition_id=cond_id, leg="NO", action="BUY_LIMIT_PLACED",
-            entry_price=levels.buy_no_price, size=no_size,
-            notes=f"tp={levels.sell_no_price:.2f} sl={levels.stop_loss_no:.2f}",
-        )
+        if no_result.get("success"):
+            order = LimitOrder(
+                order_id=no_result["order_id"],
+                token_id=levels.no_token_id,
+                side=OrderSide.BUY,
+                leg=LegType.NO,
+                price=levels.buy_no_price,
+                size=no_size,
+                condition_id=cond_id,
+                question=levels.question,
+                take_profit_price=levels.sell_no_price,
+                stop_loss_price=levels.stop_loss_no,
+            )
+            order.status = OrderStatus.ACTIVE
+            pos.entry_no = order
+            placed = True
+            log_event(
+                market=levels.question, asset=levels.asset,
+                condition_id=cond_id, leg="NO", action="BUY_LIMIT_PLACED",
+                entry_price=levels.buy_no_price, size=no_size,
+                notes=f"tp={levels.sell_no_price:.2f} sl={levels.stop_loss_no:.2f}",
+            )
 
-    if not pos.entry_yes and not pos.entry_no:
+    if not placed:
         manager.remove_position(cond_id)
         return False
 
-    log.info(
-        "NEW POSITION: %s | YES-BUY@%.2f NO-BUY@%.2f | spread=±%.2f",
-        levels.question[:45], levels.buy_yes_price, levels.buy_no_price,
-        levels.half_spread,
-    )
+    if has_yes and has_no:
+        log.info(
+            "NEW POSITION (range): %s | YES@%.2f NO@%.2f | spread=±%.2f",
+            levels.question[:45], levels.buy_yes_price, levels.buy_no_price,
+            levels.half_spread,
+        )
+    elif has_yes:
+        log.info(
+            "NEW POSITION (momentum YES): %s | BUY@%.2f → TP@%.2f SL@%.2f",
+            levels.question[:45], levels.buy_yes_price,
+            levels.sell_yes_price, levels.stop_loss_yes,
+        )
+    else:
+        log.info(
+            "NEW POSITION (momentum NO): %s | BUY@%.2f → TP@%.2f SL@%.2f",
+            levels.question[:45], levels.buy_no_price,
+            levels.sell_no_price, levels.stop_loss_no,
+        )
     return True
 
 
@@ -241,18 +272,26 @@ def run_bot() -> None:
     )
 
     manager = PositionManager(MAX_OPEN_POSITIONS, MAX_POSITION_USD)
+    tracker = PriceTracker()
     backoff = SCAN_INTERVAL
     consecutive_errors = 0
 
     while True:
         try:
-            # --- Step 1: Scan all markets and place orders ---
+            # --- Step 1: Scan markets, track prices, find entries ---
             if not MAX_OPEN_POSITIONS or manager.open_count < MAX_OPEN_POSITIONS:
                 markets = get_markets()
                 if not markets.empty:
                     new_count = 0
                     for _, market in markets.iterrows():
-                        levels = compute_levels(market.to_dict())
+                        mkt = market.to_dict()
+
+                        tracker.update(mkt["yes_token_id"], float(mkt["yes_price"]))
+
+                        signals = tracker.get_momentum_signals(mkt["yes_token_id"])
+                        mkt.update(signals)
+
+                        levels = compute_levels(mkt)
                         if levels and not manager.has_position(levels.condition_id):
                             if _place_entry_orders(levels, manager):
                                 new_count += 1

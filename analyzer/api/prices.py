@@ -90,3 +90,55 @@ async def fetch_prices_batch(
         await asyncio.gather(*[_fetch_one(a) for a in batch])
 
     return results
+
+
+def _merge_asset_windows(
+    windows: list[tuple[str, int, int]],
+) -> dict[str, tuple[int, int]]:
+    """Merge per-round (asset, start, end) into one (min_start, max_end) per asset."""
+    merged: dict[str, tuple[int, int]] = {}
+    for asset, start, end in windows:
+        if asset in merged:
+            prev_start, prev_end = merged[asset]
+            merged[asset] = (min(prev_start, start), max(prev_end, end))
+        else:
+            merged[asset] = (start, end)
+    return merged
+
+
+async def fetch_prices_for_rounds(
+    client: PolymarketClient,
+    round_windows: list[tuple[str, int, int]],
+    on_progress: Callable[[int, int], None] | None = None,
+) -> dict[str, list[dict]]:
+    """Fetch price history only for the time windows needed by closed rounds.
+
+    Merges overlapping windows per asset, then fetches concurrently.
+    Returns {asset_id: [price_points]}.
+    """
+    merged = _merge_asset_windows(round_windows)
+    if not merged:
+        return {}
+
+    results: dict[str, list[dict]] = {}
+    completed = 0
+    total = len(merged)
+    lock = asyncio.Lock()
+
+    async def _fetch_one(asset_id: str, start_ts: int, end_ts: int) -> None:
+        nonlocal completed
+        points = await fetch_price_history(client, asset_id, start_ts, end_ts)
+        async with lock:
+            if points:
+                results[asset_id] = points
+            completed += 1
+            if on_progress is not None:
+                on_progress(completed, total)
+
+    items = list(merged.items())
+    batch_size = 50
+    for i in range(0, len(items), batch_size):
+        batch = items[i : i + batch_size]
+        await asyncio.gather(*[_fetch_one(a, s, e) for a, (s, e) in batch])
+
+    return results
