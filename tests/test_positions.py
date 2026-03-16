@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from models import LegType, LimitOrder, OrderSide, OrderStatus
 from positions import MarketPosition, PositionManager
 
@@ -146,3 +148,119 @@ class TestStopLoss:
 
         stops = m.check_stop_losses({"tok_yes": 0.20})
         assert len(stops) == 0
+
+
+class TestLiveFills:
+    """Tests for check_live_fills() with mocked CLOB order status responses."""
+
+    @patch("trader.get_order_status")
+    def test_buy_fills_when_matched(self, mock_status):
+        mock_status.return_value = {"status": "MATCHED", "filled": True, "paper": False}
+
+        m = PositionManager(10, 1000.0)
+        pos = m.create_position("c1", "Q?", "BTC")
+        pos.entry_yes = _make_order(price=0.43)
+
+        events = m.check_live_fills()
+
+        assert len(events) == 1
+        assert events[0]["type"] == "fill"
+        assert events[0]["fill_price"] == 0.43
+        assert events[0]["order"].side == OrderSide.BUY
+        assert pos.entry_yes.status == OrderStatus.FILLED
+        mock_status.assert_called_once_with("paper-tok_yes")
+
+    @patch("trader.get_order_status")
+    def test_no_fill_when_live(self, mock_status):
+        mock_status.return_value = {"status": "LIVE", "filled": False, "paper": False}
+
+        m = PositionManager(10, 1000.0)
+        pos = m.create_position("c1", "Q?", "BTC")
+        pos.entry_yes = _make_order(price=0.43)
+
+        events = m.check_live_fills()
+
+        assert len(events) == 0
+        assert pos.entry_yes.status == OrderStatus.ACTIVE
+
+    @patch("trader.get_order_status")
+    def test_sell_fills_when_matched(self, mock_status):
+        mock_status.return_value = {"status": "MATCHED", "filled": True, "paper": False}
+
+        m = PositionManager(10, 1000.0)
+        pos = m.create_position("c1", "Q?", "BTC")
+        pos.exit_yes = _make_order(
+            side=OrderSide.SELL, price=0.57, take_profit=0.57,
+        )
+
+        events = m.check_live_fills()
+
+        assert len(events) == 1
+        assert events[0]["order"].side == OrderSide.SELL
+        assert pos.exit_yes.status == OrderStatus.FILLED
+
+    @patch("trader.get_order_status")
+    def test_skips_orders_without_id(self, mock_status):
+        m = PositionManager(10, 1000.0)
+        pos = m.create_position("c1", "Q?", "BTC")
+        order = _make_order(price=0.43)
+        order.order_id = None
+        pos.entry_yes = order
+
+        events = m.check_live_fills()
+
+        assert len(events) == 0
+        mock_status.assert_not_called()
+
+    @patch("trader.get_order_status")
+    def test_unknown_status_no_fill(self, mock_status):
+        mock_status.return_value = {"status": "UNKNOWN", "filled": False, "paper": False}
+
+        m = PositionManager(10, 1000.0)
+        pos = m.create_position("c1", "Q?", "BTC")
+        pos.entry_yes = _make_order(price=0.43)
+
+        events = m.check_live_fills()
+
+        assert len(events) == 0
+        assert pos.entry_yes.status == OrderStatus.ACTIVE
+
+    @patch("trader.get_order_status")
+    def test_multiple_orders_mixed_status(self, mock_status):
+        def status_by_id(order_id):
+            if order_id == "paper-tok_yes":
+                return {"status": "MATCHED", "filled": True, "paper": False}
+            return {"status": "LIVE", "filled": False, "paper": False}
+
+        mock_status.side_effect = status_by_id
+
+        m = PositionManager(10, 1000.0)
+        pos = m.create_position("c1", "Q?", "BTC")
+        pos.entry_yes = _make_order(price=0.43)
+        pos.entry_no = _make_order(
+            token_id="tok_no", leg=LegType.NO, price=0.55,
+        )
+
+        events = m.check_live_fills()
+
+        assert len(events) == 1
+        assert events[0]["order"].leg == LegType.YES
+        assert pos.entry_yes.status == OrderStatus.FILLED
+        assert pos.entry_no.status == OrderStatus.ACTIVE
+
+    @patch("trader.get_order_status")
+    def test_event_format_matches_paper_fills(self, mock_status):
+        """Verify live fill events have the same keys as paper fill events."""
+        mock_status.return_value = {"status": "MATCHED", "filled": True, "paper": False}
+
+        m = PositionManager(10, 1000.0)
+        pos = m.create_position("c1", "Q?", "BTC")
+        pos.entry_yes = _make_order(price=0.43)
+
+        live_events = m.check_live_fills()
+
+        pos2 = m.create_position("c2", "Q2?", "ETH")
+        pos2.entry_yes = _make_order(token_id="tok_yes2", price=0.43)
+        paper_events = m.check_paper_fills({"tok_yes2": 0.40})
+
+        assert live_events[0].keys() == paper_events[0].keys()

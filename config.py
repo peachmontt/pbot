@@ -25,18 +25,21 @@ PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() in ("true", "1", "yes")
 
 # Scanning
-SCAN_INTERVAL = 1
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "5"))
 
 # Order sizing: spend this many USD per side (shares = budget / price)
-ORDER_BUDGET_USD = 1.0
+ORDER_BUDGET_USD = float(os.getenv("ORDER_BUDGET_USD", "1.0"))
 MIN_ORDER_USD = 0.10
 MIN_ORDERBOOK_LIQUIDITY_USD = 5.0
 FEE_RATE = 0.02
 
 # Strategy selection: name of a module inside the strategies/ package
 # model_1 = symmetric range trading, model_2 = momentum following
-STRATEGY = os.getenv("STRATEGY", "model_2")
+STRATEGY = os.getenv("STRATEGY", "model_1")
 
 # Risk limits (0 = unlimited)
-MAX_OPEN_POSITIONS = 0
-MAX_POSITION_USD = 1000.0
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+MAX_POSITION_USD = float(os.getenv("MAX_POSITION_USD", "1000.0"))
+
+# Only trade markets resolving within this window (0 = no filter)
+MAX_MARKET_HOURS_TO_EXPIRY = int(os.getenv("MAX_MARKET_HOURS_TO_EXPIRY", "24"))

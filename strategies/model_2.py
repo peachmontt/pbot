@@ -53,6 +53,16 @@ MAX_ENTRIES_PER_MARKET = 8
 SCALE_IN_THRESHOLD = 0.02
 
 
+def startup_check() -> None:
+    """Called by load_strategy at startup. Fails fast if feature flag is off."""
+    if not FEATURE_FLAG:
+        raise RuntimeError(
+            "Strategy 'model_2' is selected but FEATURE_MODEL_2 is not enabled. "
+            "Set FEATURE_MODEL_2=true in your .env or environment, "
+            "or switch to STRATEGY=model_1."
+        )
+
+
 def compute_levels(market: dict[str, Any]) -> OrderLevels | None:
     """Compute directional entry levels based on momentum signals.
 

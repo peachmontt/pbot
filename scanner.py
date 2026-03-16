@@ -1,10 +1,11 @@
 import json
 import logging
+from datetime import datetime, timezone
 
 import pandas as pd
 import requests
 
-from config import POLYMARKET_API
+from config import MAX_MARKET_HOURS_TO_EXPIRY, POLYMARKET_API
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ def get_markets() -> pd.DataFrame:
     markets: list[dict] = []
     seen_conditions: set[str] = set()
     skipped_data = 0
+    skipped_expiry = 0
     total_fetched = 0
 
     for page in range(MAX_PAGES):
@@ -73,6 +75,23 @@ def get_markets() -> pd.DataFrame:
                 continue
             seen_conditions.add(cond_id)
 
+            if MAX_MARKET_HOURS_TO_EXPIRY > 0:
+                end_date_str = m.get("endDate") or m.get("end_date_iso")
+                if not end_date_str:
+                    skipped_expiry += 1
+                    continue
+                try:
+                    end_dt = datetime.fromisoformat(
+                        end_date_str.replace("Z", "+00:00"),
+                    )
+                    hours_left = (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+                except (ValueError, TypeError):
+                    skipped_expiry += 1
+                    continue
+                if hours_left <= 0 or hours_left > MAX_MARKET_HOURS_TO_EXPIRY:
+                    skipped_expiry += 1
+                    continue
+
             outcomes = _parse_array_maybe_json(m.get("outcomes"))
             prices = _parse_array_maybe_json(m.get("outcomePrices"))
             token_ids = _parse_array_maybe_json(m.get("clobTokenIds"))
@@ -101,6 +120,7 @@ def get_markets() -> pd.DataFrame:
                 "question": question,
                 "condition_id": cond_id,
                 "slug": m.get("slug"),
+                "end_date_iso": m.get("endDate") or m.get("end_date_iso"),
                 "yes_price": yes_price,
                 "no_price": no_price,
                 "yes_token_id": yes_token_id,
@@ -111,7 +131,7 @@ def get_markets() -> pd.DataFrame:
             break
 
     log.info(
-        "Fetched %d markets → %d eligible (skipped: %d bad-data)",
-        total_fetched, len(markets), skipped_data,
+        "Fetched %d markets → %d eligible (skipped: %d bad-data, %d expiry-filter)",
+        total_fetched, len(markets), skipped_data, skipped_expiry,
     )
     return pd.DataFrame(markets)

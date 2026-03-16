@@ -42,6 +42,16 @@ def _ensure_client():
     return client
 
 
+def verify_connection() -> dict[str, Any]:
+    """Test CLOB client connectivity at startup. Returns {success, reason?}."""
+    try:
+        _ensure_client()
+        log.info("CLOB client connected successfully")
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "reason": str(e)}
+
+
 def _fetch_orderbook_public(token_id: str) -> dict:
     import requests
 

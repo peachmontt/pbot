@@ -180,6 +180,39 @@ class PositionManager:
 
         return events
 
+    def check_live_fills(self) -> list[dict[str, Any]]:
+        """
+        Live mode: detect fills by polling order status via the CLOB API.
+
+        Returns the same event format as check_paper_fills() so bot.py
+        can process fills identically regardless of mode.
+        """
+        from trader import get_order_status
+
+        events: list[dict[str, Any]] = []
+
+        for pos in list(self._positions.values()):
+            for order in pos.active_orders():
+                if not order.order_id:
+                    continue
+
+                resp = get_order_status(order.order_id)
+                if resp.get("filled"):
+                    order.mark_filled(order.price)
+                    events.append({
+                        "type": "fill",
+                        "order": order,
+                        "condition_id": pos.condition_id,
+                        "fill_price": order.price,
+                    })
+                    log.info(
+                        "[LIVE FILL] %s %s %s@%.3f",
+                        order.side.value, order.leg.value,
+                        pos.question[:30], order.price,
+                    )
+
+        return events
+
     def check_stop_losses(
         self,
         current_prices: dict[str, float],

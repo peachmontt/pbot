@@ -1,7 +1,12 @@
 import json
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from scanner import _parse_array_maybe_json, get_markets
+
+_DEFAULT_END_DATE = (
+    datetime.now(timezone.utc) + timedelta(hours=12)
+).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class TestParseArrayMaybeJson:
@@ -30,8 +35,9 @@ def _make_gamma_market(
     prices=None,
     token_ids=None,
     condition_id="cond123",
+    end_date=None,
 ):
-    return {
+    m = {
         "question": question,
         "outcomes": json.dumps(outcomes or ["Yes", "No"]),
         "outcomePrices": json.dumps(prices or ["0.65", "0.35"]),
@@ -39,6 +45,9 @@ def _make_gamma_market(
         "conditionId": condition_id,
         "slug": "btc-100k",
     }
+    if end_date is not False:
+        m["endDate"] = end_date if end_date is not None else _DEFAULT_END_DATE
+    return m
 
 
 class TestGetMarkets:
@@ -147,3 +156,91 @@ class TestGetMarkets:
 
         df = get_markets()
         assert df.empty
+
+
+class TestExpiryFilter:
+    """Tests for MAX_MARKET_HOURS_TO_EXPIRY filtering in get_markets."""
+
+    @patch("scanner.requests.get")
+    def test_market_within_24h_included(self, mock_get):
+        end = (datetime.now(timezone.utc) + timedelta(hours=6)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+        )
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [_make_gamma_market(end_date=end)]
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+
+        df = get_markets()
+        assert len(df) == 1
+
+    @patch("scanner.requests.get")
+    def test_market_beyond_24h_excluded(self, mock_get):
+        end = (datetime.now(timezone.utc) + timedelta(hours=48)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+        )
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [_make_gamma_market(end_date=end)]
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+
+        df = get_markets()
+        assert df.empty
+
+    @patch("scanner.requests.get")
+    def test_already_expired_market_excluded(self, mock_get):
+        end = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+        )
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [_make_gamma_market(end_date=end)]
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+
+        df = get_markets()
+        assert df.empty
+
+    @patch("scanner.requests.get")
+    def test_missing_enddate_excluded(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [_make_gamma_market(end_date=False)]
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+
+        df = get_markets()
+        assert df.empty
+
+    @patch("scanner.requests.get")
+    def test_unparseable_enddate_excluded(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [_make_gamma_market(end_date="not-a-date")]
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+
+        df = get_markets()
+        assert df.empty
+
+    @patch("scanner.MAX_MARKET_HOURS_TO_EXPIRY", 0)
+    @patch("scanner.requests.get")
+    def test_filter_disabled_when_zero(self, mock_get):
+        """When MAX_MARKET_HOURS_TO_EXPIRY=0, no expiry filtering happens."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [_make_gamma_market(end_date=False)]
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+
+        df = get_markets()
+        assert len(df) == 1
+
+    @patch("scanner.requests.get")
+    def test_enddate_passes_through_in_result(self, mock_get):
+        end = (datetime.now(timezone.utc) + timedelta(hours=6)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+        )
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [_make_gamma_market(end_date=end)]
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+
+        df = get_markets()
+        assert df.iloc[0]["end_date_iso"] == end

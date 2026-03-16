@@ -50,10 +50,17 @@ def load_strategy(name: str) -> ComputeLevelsFn:
     Import strategies.<name> and return its compute_levels function.
 
     Raises ImportError if the module or function is missing.
+    Raises RuntimeError if the strategy's startup_check() fails
+    (e.g. required feature flag is off).
     """
     module = importlib.import_module(f"strategies.{name}")
     fn = getattr(module, "compute_levels", None)
     if fn is None:
         raise ImportError(f"Strategy 'strategies.{name}' has no compute_levels function")
+
+    startup_check = getattr(module, "startup_check", None)
+    if startup_check is not None:
+        startup_check()
+
     log.info("Loaded strategy: %s", name)
     return fn

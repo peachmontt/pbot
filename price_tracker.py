@@ -81,6 +81,19 @@ class PriceTracker:
             "price_change_15m": change_15m if change_15m is not None else 0.0,
         }
 
+    def is_warm(self, token_id: str, seconds: int) -> bool:
+        """True if token has at least ``seconds`` of collected history."""
+        buf = self._history.get(token_id)
+        if not buf or len(buf) < 2:
+            return False
+        return (buf[-1].timestamp - buf[0].timestamp) >= seconds
+
+    def warm_up_summary(self, required_seconds: int = 900) -> tuple[int, int]:
+        """Return (warm_count, total_tracked) for the given threshold."""
+        total = len(self._history)
+        warm = sum(1 for tid in self._history if self.is_warm(tid, required_seconds))
+        return warm, total
+
     @property
     def tracked_count(self) -> int:
         return len(self._history)

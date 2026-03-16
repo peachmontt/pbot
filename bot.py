@@ -30,6 +30,7 @@ from config import (
     MAX_POSITION_USD,
     ORDER_BUDGET_USD,
     PAPER_TRADING,
+    PRIVATE_KEY,
     SCAN_INTERVAL,
     STRATEGY,
 )
@@ -44,6 +45,7 @@ from trader import (
     get_mid_price,
     market_sell,
     place_limit_order,
+    verify_connection,
 )
 
 log = logging.getLogger(__name__)
@@ -266,7 +268,29 @@ def _get_current_prices(manager: PositionManager) -> dict[str, float]:
 
 def run_bot() -> None:
     mode = "PAPER" if PAPER_TRADING else "LIVE"
-    compute_levels = load_strategy(STRATEGY)
+    try:
+        compute_levels = load_strategy(STRATEGY)
+    except (ImportError, RuntimeError) as exc:
+        log.error("Cannot start: %s", exc)
+        sys.exit(1)
+    if not PAPER_TRADING:
+        if not PRIVATE_KEY:
+            log.error("LIVE MODE requires PRIVATE_KEY in .env. Exiting.")
+            sys.exit(1)
+
+        conn = verify_connection()
+        if not conn.get("success"):
+            log.error("CLOB connection failed: %s. Exiting.", conn.get("reason"))
+            sys.exit(1)
+
+        log.warning(
+            "=== LIVE MODE — real money at risk. Budget: $%.2f/trade, max %d positions ===",
+            ORDER_BUDGET_USD, MAX_OPEN_POSITIONS,
+        )
+        for i in range(5, 0, -1):
+            log.warning("Starting in %d seconds... (Ctrl+C to abort)", i)
+            time.sleep(1)
+
     log.info(
         "Bot started (%s mode, strategy=%s). Press Ctrl+C to stop.", mode, STRATEGY,
     )
@@ -282,7 +306,12 @@ def run_bot() -> None:
             if not MAX_OPEN_POSITIONS or manager.open_count < MAX_OPEN_POSITIONS:
                 markets = get_markets()
                 if not markets.empty:
-                    new_count = 0
+                    n_fetched = len(markets)
+                    n_signal = 0
+                    n_rejected = 0
+                    n_held = 0
+                    n_placed = 0
+
                     for _, market in markets.iterrows():
                         mkt = market.to_dict()
 
@@ -292,65 +321,105 @@ def run_bot() -> None:
                         mkt.update(signals)
 
                         levels = compute_levels(mkt)
-                        if levels and not manager.has_position(levels.condition_id):
-                            if _place_entry_orders(levels, manager):
-                                new_count += 1
-                    if new_count:
-                        log.info("Placed orders on %d new market(s).", new_count)
+                        if levels is None:
+                            n_rejected += 1
+                            continue
+
+                        n_signal += 1
+                        if manager.has_position(levels.condition_id):
+                            n_held += 1
+                            continue
+
+                        if MAX_OPEN_POSITIONS and manager.open_count >= MAX_OPEN_POSITIONS:
+                            break
+
+                        live_mid = get_mid_price(mkt["yes_token_id"])
+                        if live_mid is not None:
+                            mkt["yes_price"] = live_mid
+                            mkt["no_price"] = round(1.0 - live_mid, 4)
+                            levels = compute_levels(mkt)
+                            if levels is None:
+                                n_rejected += 1
+                                continue
+
+                        if _place_entry_orders(levels, manager):
+                            n_placed += 1
+
+                    warm, tracked = tracker.warm_up_summary(15 * 60)
+                    if tracked > 0 and warm == 0:
+                        log.info(
+                            "Tracker warming up: 0/%d tokens have 15 min of history yet",
+                            tracked,
+                        )
+
+                    log.info(
+                        "Cycle: %d scanned → %d signals (%d rejected) | "
+                        "%d held | %d placed | %d open | tracker: %d/%d warm",
+                        n_fetched, n_signal, n_rejected,
+                        n_held, n_placed, manager.open_count,
+                        warm, tracked,
+                    )
 
             # --- Step 2: Monitor existing positions ---
             if manager.open_count > 0:
                 current_prices = _get_current_prices(manager)
+                log.info(
+                    "Monitoring %d positions (%d price quotes)",
+                    manager.open_count, len(current_prices),
+                )
 
                 if PAPER_TRADING:
                     fill_events = manager.check_paper_fills(current_prices)
-                    for event in fill_events:
-                        order = event["order"]
-                        cond_id = event["condition_id"]
-                        pos = manager.get_position(cond_id)
-                        if not pos:
-                            continue
+                else:
+                    fill_events = manager.check_live_fills()
 
-                        if order.side == OrderSide.BUY:
-                            log.info(
-                                "BUY FILLED: %s %s@%.3f (market=%.3f)",
-                                order.leg.value, pos.question[:35],
-                                order.price, event["fill_price"],
-                            )
-                            log_event(
-                                market=pos.question, asset=pos.asset,
-                                condition_id=cond_id, leg=order.leg.value,
-                                action="BUY_FILLED",
-                                entry_price=order.price, size=order.size,
-                            )
-                            exit_order = _place_take_profit(order, manager)
-                            if order.leg == LegType.YES:
-                                pos.exit_yes = exit_order
-                            else:
-                                pos.exit_no = exit_order
+                for event in fill_events:
+                    order = event["order"]
+                    cond_id = event["condition_id"]
+                    pos = manager.get_position(cond_id)
+                    if not pos:
+                        continue
 
-                        elif order.side == OrderSide.SELL:
-                            pnl = (order.price - (
-                                pos.entry_yes.price if order.leg == LegType.YES
-                                else pos.entry_no.price
-                            )) * order.size
-                            log.info(
-                                "TAKE-PROFIT FILLED: %s %s | sell@%.3f | pnl=$%.2f",
-                                order.leg.value, pos.question[:35],
-                                order.price, pnl,
-                            )
-                            entry_price = (
-                                pos.entry_yes.price if order.leg == LegType.YES
-                                else pos.entry_no.price
-                            )
-                            log_event(
-                                market=pos.question, asset=pos.asset,
-                                condition_id=cond_id, leg=order.leg.value,
-                                action="TAKE_PROFIT_FILLED",
-                                entry_price=entry_price,
-                                exit_price=order.price, size=order.size,
-                                pnl=pnl,
-                            )
+                    if order.side == OrderSide.BUY:
+                        log.info(
+                            "BUY FILLED: %s %s@%.3f (market=%.3f)",
+                            order.leg.value, pos.question[:35],
+                            order.price, event["fill_price"],
+                        )
+                        log_event(
+                            market=pos.question, asset=pos.asset,
+                            condition_id=cond_id, leg=order.leg.value,
+                            action="BUY_FILLED",
+                            entry_price=order.price, size=order.size,
+                        )
+                        exit_order = _place_take_profit(order, manager)
+                        if order.leg == LegType.YES:
+                            pos.exit_yes = exit_order
+                        else:
+                            pos.exit_no = exit_order
+
+                    elif order.side == OrderSide.SELL:
+                        pnl = (order.price - (
+                            pos.entry_yes.price if order.leg == LegType.YES
+                            else pos.entry_no.price
+                        )) * order.size
+                        log.info(
+                            "TAKE-PROFIT FILLED: %s %s | sell@%.3f | pnl=$%.2f",
+                            order.leg.value, pos.question[:35],
+                            order.price, pnl,
+                        )
+                        entry_price = (
+                            pos.entry_yes.price if order.leg == LegType.YES
+                            else pos.entry_no.price
+                        )
+                        log_event(
+                            market=pos.question, asset=pos.asset,
+                            condition_id=cond_id, leg=order.leg.value,
+                            action="TAKE_PROFIT_FILLED",
+                            entry_price=entry_price,
+                            exit_price=order.price, size=order.size,
+                            pnl=pnl,
+                        )
 
                 stop_events = manager.check_stop_losses(current_prices)
                 for stop in stop_events:
