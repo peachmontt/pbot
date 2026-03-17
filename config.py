@@ -43,3 +43,13 @@ MAX_POSITION_USD = float(os.getenv("MAX_POSITION_USD", "1000.0"))
 
 # Only trade markets resolving within this window (0 = no filter)
 MAX_MARKET_HOURS_TO_EXPIRY = int(os.getenv("MAX_MARKET_HOURS_TO_EXPIRY", "24"))
+
+# AI strategy (model_3)
+AI_ENABLED = os.getenv("AI_ENABLED", "false").lower() in ("true", "1", "yes")
+AI_PROVIDER = os.getenv("AI_PROVIDER", "openai")       # openai | anthropic
+AI_MODEL = os.getenv("AI_MODEL", "gpt-5")
+AI_SCAN_INTERVAL_SEC = int(os.getenv("AI_SCAN_INTERVAL_SEC", "60"))
+AI_SIGNAL_TTL_SEC = int(os.getenv("AI_SIGNAL_TTL_SEC", "90"))
+AI_TOP_K = int(os.getenv("AI_TOP_K", "20"))
+AI_MIN_CONFIDENCE = float(os.getenv("AI_MIN_CONFIDENCE", "0.65"))
+AI_MIN_ATTENTION = float(os.getenv("AI_MIN_ATTENTION", "0.70"))
