@@ -1,6 +1,7 @@
 import json
 import logging
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import requests
@@ -10,7 +11,8 @@ from config import MAX_MARKET_HOURS_TO_EXPIRY, POLYMARKET_API
 log = logging.getLogger(__name__)
 
 FETCH_LIMIT = 500
-MAX_PAGES = 3
+MAX_PAGES_DEFAULT = 3
+MAX_PAGES_EXPIRY = 20
 
 
 def _parse_array_maybe_json(value):
@@ -30,30 +32,39 @@ def _parse_array_maybe_json(value):
 
 def get_markets() -> pd.DataFrame:
     """
-    Fetch all active binary markets from the Gamma API.
+    Fetch active binary markets from the Gamma API.
 
-    Paginates through up to MAX_PAGES * FETCH_LIMIT markets.
-    Only filters for valid data (binary outcomes with parseable prices
-    and token IDs).
+    When MAX_MARKET_HOURS_TO_EXPIRY > 0, uses the API's end_date_min/max
+    params to request only near-expiry markets, then applies hour-precision
+    filtering client-side. Paginates until all matching markets are fetched.
+
+    When MAX_MARKET_HOURS_TO_EXPIRY == 0, fetches up to MAX_PAGES_DEFAULT
+    pages without date filtering.
     """
+    use_expiry = MAX_MARKET_HOURS_TO_EXPIRY > 0
+    max_pages = MAX_PAGES_EXPIRY if use_expiry else MAX_PAGES_DEFAULT
+
+    now = datetime.now(timezone.utc)
+    base_params: dict[str, str] = {
+        "active": "true",
+        "closed": "false",
+        "limit": str(FETCH_LIMIT),
+    }
+    if use_expiry:
+        base_params["end_date_min"] = now.strftime("%Y-%m-%d")
+        days_ahead = math.ceil(MAX_MARKET_HOURS_TO_EXPIRY / 24) + 1
+        base_params["end_date_max"] = (now + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+
     markets: list[dict] = []
     seen_conditions: set[str] = set()
     skipped_data = 0
     skipped_expiry = 0
     total_fetched = 0
 
-    for page in range(MAX_PAGES):
+    for page in range(max_pages):
         try:
-            r = requests.get(
-                POLYMARKET_API,
-                params={
-                    "active": "true",
-                    "closed": "false",
-                    "limit": FETCH_LIMIT,
-                    "offset": page * FETCH_LIMIT,
-                },
-                timeout=30,
-            )
+            params = {**base_params, "offset": str(page * FETCH_LIMIT)}
+            r = requests.get(POLYMARKET_API, params=params, timeout=30)
             r.raise_for_status()
             batch = r.json()
         except requests.RequestException as e:
@@ -75,7 +86,7 @@ def get_markets() -> pd.DataFrame:
                 continue
             seen_conditions.add(cond_id)
 
-            if MAX_MARKET_HOURS_TO_EXPIRY > 0:
+            if use_expiry:
                 end_date_str = m.get("endDate") or m.get("end_date_iso")
                 if not end_date_str:
                     skipped_expiry += 1
@@ -84,7 +95,7 @@ def get_markets() -> pd.DataFrame:
                     end_dt = datetime.fromisoformat(
                         end_date_str.replace("Z", "+00:00"),
                     )
-                    hours_left = (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+                    hours_left = (end_dt - now).total_seconds() / 3600
                 except (ValueError, TypeError):
                     skipped_expiry += 1
                     continue

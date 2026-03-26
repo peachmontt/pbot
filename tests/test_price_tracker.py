@@ -54,7 +54,7 @@ class TestGetChange:
         tracker.update("tok_a", 0.50)
         assert tracker.get_change("tok_a", 300) is None
 
-    def test_returns_none_if_not_enough_history(self, tracker: PriceTracker) -> None:
+    def test_uses_available_history_when_short(self, tracker: PriceTracker) -> None:
         base = time.time()
         with patch("price_tracker.time.time") as mock_time:
             mock_time.return_value = base
@@ -62,7 +62,9 @@ class TestGetChange:
             mock_time.return_value = base + 60
             tracker.update("tok_a", 0.55)
 
-        assert tracker.get_change("tok_a", 300) is None
+        change = tracker.get_change("tok_a", 300)
+        assert change is not None
+        assert abs(change - 0.05) < 1e-9
 
     def test_computes_positive_change(self, tracker: PriceTracker) -> None:
         base = time.time()

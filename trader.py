@@ -14,9 +14,14 @@ load_dotenv()
 
 from config import (
     CHAIN_ID,
+    FUNDER_ADDRESS,
     MIN_ORDER_USD,
     MIN_ORDERBOOK_LIQUIDITY_USD,
     PAPER_TRADING,
+    POLY_BUILDER_API_KEY,
+    POLY_BUILDER_PASSPHRASE,
+    POLY_BUILDER_SECRET,
+    POLY_SIGNATURE_TYPE,
     POLYMARKET_CLOB_HOST,
     PRIVATE_KEY,
 )
@@ -24,6 +29,46 @@ from config import (
 log = logging.getLogger(__name__)
 
 _client: Any = None
+_relay_client: Any = None
+
+
+def _build_builder_config():
+    """Create BuilderConfig from env vars (None if creds are missing)."""
+    if not (POLY_BUILDER_API_KEY and POLY_BUILDER_SECRET and POLY_BUILDER_PASSPHRASE):
+        return None
+    from py_builder_signing_sdk.config import BuilderConfig
+    from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
+    return BuilderConfig(
+        local_builder_creds=BuilderApiKeyCreds(
+            key=POLY_BUILDER_API_KEY,
+            secret=POLY_BUILDER_SECRET,
+            passphrase=POLY_BUILDER_PASSPHRASE,
+        )
+    )
+
+
+def _ensure_relay_client():
+    """Lazily create the RelayClient for gasless on-chain ops (deploy, approve)."""
+    global _relay_client
+    if _relay_client is not None:
+        return _relay_client
+    key = PRIVATE_KEY or os.getenv("PRIVATE_KEY")
+    if not key:
+        raise RuntimeError("PRIVATE_KEY not found")
+    builder_config = _build_builder_config()
+    if builder_config is None:
+        raise RuntimeError(
+            "Builder credentials required. Set POLY_BUILDER_API_KEY, "
+            "POLY_BUILDER_SECRET, POLY_BUILDER_PASSPHRASE in .env"
+        )
+    from py_builder_relayer_client.client import RelayClient
+    _relay_client = RelayClient(
+        "https://relayer-v2.polymarket.com",
+        CHAIN_ID,
+        key,
+        builder_config,
+    )
+    return _relay_client
 
 
 def _ensure_client():
@@ -33,11 +78,24 @@ def _ensure_client():
     key = PRIVATE_KEY or os.getenv("PRIVATE_KEY")
     if not key:
         raise RuntimeError("PRIVATE_KEY not found. Add PRIVATE_KEY to .env")
+
     from py_clob_client.client import ClobClient
 
-    client = ClobClient(POLYMARKET_CLOB_HOST, key=key, chain_id=CHAIN_ID)
+    builder_config = _build_builder_config()
+
+    client = ClobClient(
+        POLYMARKET_CLOB_HOST,
+        key=key,
+        chain_id=CHAIN_ID,
+        signature_type=POLY_SIGNATURE_TYPE,
+        funder=FUNDER_ADDRESS,
+        builder_config=builder_config,
+    )
+
     creds = client.create_or_derive_api_creds()
     client.set_api_creds(creds)
+    log.info("CLOB client initialised (builder_config=%s)", "yes" if builder_config else "no")
+
     _client = client
     return client
 
@@ -45,8 +103,56 @@ def _ensure_client():
 def verify_connection() -> dict[str, Any]:
     """Test CLOB client connectivity at startup. Returns {success, reason?}."""
     try:
-        _ensure_client()
+        client = _ensure_client()
         log.info("CLOB client connected successfully")
+
+        signer_addr = client.get_address()
+        funder_addr = client.builder.funder
+        sig_type = client.builder.sig_type
+        log.info(
+            "Wallet config: signer=%s funder=%s sig_type=%d",
+            signer_addr, funder_addr, sig_type,
+        )
+
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        try:
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                signature_type=sig_type,
+            )
+            bal_info = client.get_balance_allowance(params)
+            balance = int(bal_info.get("balance", "0"))
+            allowances = bal_info.get("allowances", {})
+            has_allowance = any(int(v) > 0 for v in allowances.values())
+            balance_usdc = balance / 1e6
+
+            if balance == 0:
+                log.error(
+                    "USDC.e balance is ZERO for %s (sig_type=%d). "
+                    "Orders will fail with 'not enough balance'. "
+                    "Deposit USDC.e or check your PRIVATE_KEY.",
+                    funder_addr, sig_type,
+                )
+                return {
+                    "success": False,
+                    "reason": (
+                        f"Zero USDC.e balance on {funder_addr}. "
+                        f"Deposit funds or verify PRIVATE_KEY matches "
+                        f"your Polymarket account."
+                    ),
+                }
+
+            if not has_allowance:
+                log.warning(
+                    "USDC.e balance=$%.2f but exchange allowances are ZERO. "
+                    "Orders may fail. Make one trade via Polymarket UI first.",
+                    balance_usdc,
+                )
+
+            log.info("USDC.e balance: $%.2f | allowances OK: %s", balance_usdc, has_allowance)
+        except Exception as bal_err:
+            log.warning("Could not check balance (non-fatal): %s", bal_err)
+
         return {"success": True}
     except Exception as e:
         return {"success": False, "reason": str(e)}

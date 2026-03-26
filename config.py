@@ -21,6 +21,41 @@ BINANCE_SYMBOLS = {
 # Keys
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 
+# Polymarket signature type: 0 = EOA, 1 = POLY_PROXY, 2 = POLY_GNOSIS_SAFE
+POLY_SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "0"))
+FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS") or None
+
+# Builder API credentials (from Polymarket Builder Settings page)
+POLY_BUILDER_API_KEY = os.getenv("POLY_BUILDER_API_KEY") or None
+POLY_BUILDER_SECRET = os.getenv("POLY_BUILDER_SECRET") or None
+POLY_BUILDER_PASSPHRASE = os.getenv("POLY_BUILDER_PASSPHRASE") or None
+
+
+def _normalise_private_key(raw: str | None) -> str | None:
+    """Accept hex or base64-encoded private keys, always return hex."""
+    if not raw:
+        return None
+    raw = raw.strip().strip('"').strip("'")
+    if raw.startswith("0x") or all(c in "0123456789abcdefABCDEF" for c in raw):
+        return raw
+    import base64
+    try:
+        decoded = base64.urlsafe_b64decode(raw + "==")
+        if len(decoded) == 32:
+            return "0x" + decoded.hex()
+    except Exception:
+        pass
+    try:
+        decoded = base64.b64decode(raw + "==")
+        if len(decoded) == 32:
+            return "0x" + decoded.hex()
+    except Exception:
+        pass
+    return raw
+
+
+PRIVATE_KEY = _normalise_private_key(os.getenv("PRIVATE_KEY"))
+
 # Paper trading: True = simulation, False = real orders
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() in ("true", "1", "yes")
 

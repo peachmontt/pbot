@@ -51,8 +51,10 @@ class PriceTracker:
     def get_change(self, token_id: str, seconds: int) -> float | None:
         """Price change over the last `seconds`.
 
-        Returns the absolute price difference (current - past),
-        or None if not enough history.
+        Returns the absolute price difference (current - past).
+        If less than `seconds` of history exists, uses the oldest
+        available data point so signals can fire immediately.
+        Returns None only when fewer than 2 data points exist.
         """
         buf = self._history.get(token_id)
         if not buf or len(buf) < 2:
@@ -60,8 +62,6 @@ class PriceTracker:
 
         now = buf[-1].timestamp
         target = now - seconds
-        if buf[0].timestamp > target:
-            return None
 
         past_point = buf[0]
         for point in buf:
