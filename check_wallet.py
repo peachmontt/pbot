@@ -23,7 +23,7 @@ def main():
     signer = Account.from_key(PRIVATE_KEY).address
     funder = FUNDER_ADDRESS or signer
     rpc = "https://polygon-rpc.com"
-    usdc_e = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    usdc_e = "0x2791Bca***7174"
 
     print(f"\n{'='*60}")
     print(f"  Polymarket Wallet Diagnostic")
